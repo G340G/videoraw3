@@ -8,6 +8,7 @@ generate.py — "Found VHS Job Training" analogue horror PPT generator.
 - Lone Shooter entity: fictional shadow figure with bright eyes.
 - Audio: distorted 90s "training jingle" + noise stingers + TTS.
 - FIXED: Replaced imageio with direct ffmpeg piping to avoid backend errors.
+- FIXED: Corrected argument passing for timecode overlays and slate generation.
 
 Usage:
   python generate.py --config config.yaml --out out.mp4
@@ -38,7 +39,7 @@ from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 from scipy.io.wavfile import read as read_wav
 from scipy.io.wavfile import write as write_wav
 
-UA = "pptex-vhs-generator/3.1 (+github-actions; educational/art project)"
+UA = "pptex-vhs-generator/3.2 (+github-actions; educational/art project)"
 
 DEFAULTS: Dict[str, Any] = {
     "seed": 1337,
@@ -49,16 +50,13 @@ DEFAULTS: Dict[str, Any] = {
     "web": {
         "enable": True,
         "timeout_s": 15,
-        "extra_creepy_image_limit": 10,
-        "extra_creepy_queries": ["uncanny face", "surveillance camera still", "empty hallway", "passport photo", "training poster", "security badge", "office portrait"],
-        "query_expand": ["{k}", "{k} poster", "{k} manual", "{k} office", "{k} diagram", "{k} photograph", "{k} signage"],
         "text_paragraphs": 10,
         "image_limit": 16,
         "random_source": "mix",
         "random_attempts": 5,
         "min_keyword_len": 3,
         "max_keyword_len": 48,
-        
+        "query_expand": ["{k}", "{k} poster", "{k} office", "{k} training"],
     },
     "story": {
         "slide_count": 12,
@@ -67,10 +65,6 @@ DEFAULTS: Dict[str, Any] = {
         "include_infographic": True,
         "include_jane_doe": True,
         "include_fatal": True,
-        "include_infographic": True,
-        "include_forensic": True,
-        "infographic_slides": 2,
-        "forensic_slides": 2,
         "fatal_probability": 0.12,
         "jane_doe_probability": 0.18,
         "easter_egg_probability": 0.33,
@@ -88,10 +82,6 @@ DEFAULTS: Dict[str, Any] = {
         "vhs_strength": 1.25,
         "redaction_strength": 1.25,
         "flashes": 12,
-        "infographic_strength": 1.4,
-        "forensic_zoom_strength": 1.6,
-        "chart_count_per_tape": 3,
-        "zoom_callouts_per_tape": 4,
         "censor_probability": 0.35,
         "entity_overlay_probability": 0.09,
     },
@@ -369,6 +359,83 @@ def extract_related_terms(rng: random.Random, theme_key: str, scraped_text: str,
             cleaned.append(x)
     return cleaned[: max_terms]
 
+
+def extract_numeric_facts(scraped_text: str, max_items: int = 8) -> List[Tuple[str, float, str]]:
+    """
+    Pull a few numeric facts from text to drive 'real numbers' charts.
+    Returns list of (label, value, unit).
+    Heuristics: years, percentages, counts with units.
+    """
+    txt = scraped_text or ""
+    facts: List[Tuple[str, float, str]] = []
+
+    # Percentages
+    for m in re.finditer(r"\b(\d{1,3}(?:\.\d+)?)\s*%\b", txt):
+        v = float(m.group(1))
+        if 0 <= v <= 100:
+            facts.append(("RATE", v, "%"))
+        if len(facts) >= max_items:
+            return facts[:max_items]
+
+    # Years
+    for m in re.finditer(r"\b(18\d{2}|19\d{2}|20\d{2})\b", txt):
+        y = float(m.group(1))
+        facts.append(("YEAR", y, ""))
+        if len(facts) >= max_items:
+            return facts[:max_items]
+
+    # Simple number + unit
+    unit_pat = r"\b(\d{1,6}(?:,\d{3})*(?:\.\d+)?)\s*(people|cases|items|km|miles|meters|hours|minutes|days|weeks|months|years)\b"
+    for m in re.finditer(unit_pat, txt, flags=re.I):
+        raw = m.group(1).replace(",", "")
+        try:
+            v = float(raw)
+        except Exception:
+            continue
+        unit = m.group(2).lower()
+        label = unit.upper()
+        facts.append((label, v, unit))
+        if len(facts) >= max_items:
+            break
+
+    return facts[:max_items]
+
+
+def theme_metric_labels(rng: random.Random, theme_key: str, related_terms: List[str]) -> List[str]:
+    """
+    Generate semi-coherent metric labels for infographics based on theme.
+    """
+    base = [
+        "COMPLIANCE", "RECALL", "STRESS", "TRUST", "SLEEP", "ATTENTION",
+        "ANOMALY", "SIGNAL", "NOISE", "DRIFT", "RETENTION"
+    ]
+    themed = []
+    tk = (theme_key or "").strip()
+    if tk:
+        themed.append(tk.upper()[:10])
+    for t in (related_terms or [])[:6]:
+        w = re.sub(r"[^A-Za-z0-9]+", " ", t).strip().split()
+        if w:
+            themed.append(w[0].upper()[:10])
+    pool = list(dict.fromkeys(themed + base))
+    rng.shuffle(pool)
+    return pool[:5]
+
+
+def choose_forensic_roi(rng: random.Random, W: int, H: int) -> Tuple[int, int, int, int]:
+    """
+    Pick a region-of-interest consistent with 'eye inspection' vibes.
+    Without face detection, bias toward upper-center.
+    """
+    cx = int(W * (0.45 + 0.10 * rng.random()))
+    cy = int(H * (0.30 + 0.10 * rng.random()))
+    rw = int(W * (0.28 + 0.08 * rng.random()))
+    rh = int(H * (0.18 + 0.06 * rng.random()))
+    x0 = max(0, cx - rw // 2)
+    y0 = max(0, cy - rh // 2)
+    x1 = min(W, x0 + rw)
+    y1 = min(H, y0 + rh)
+    return x0, y0, x1, y1
 # ----------------------------
 # Story + slides
 # ----------------------------
@@ -438,7 +505,8 @@ def inject_entity_mentions(rng: random.Random, lines: List[str], count: int) -> 
 
 def build_template_slides(rng: random.Random, theme_key: str, scraped_text: str,
                          web_images: List[Image.Image], local_images: List[Image.Image],
-                         cfg: Dict[str, Any], tape_no: int) -> List[Slide]:
+                         cfg: Dict[str, Any], tape_no: int,
+                         related_terms: Optional[List[str]] = None) -> List[Slide]:
     story = cfg["story"]
     render = cfg["render"]
     slide_seconds = float(render["slide_seconds"])
@@ -464,6 +532,18 @@ def build_template_slides(rng: random.Random, theme_key: str, scraped_text: str,
 
     slides: List[Slide] = []
 
+    # Module slates (black cards) keep structure consistent across tapes.
+    rel = list(related_terms or [])
+    tape_slate = "\n".join([
+        f"TAPE NUMBER: {tape_no:02d}-{rng.randint(100,999)}",
+        f"YEAR: {rng.randint(1988, 1997)}   FORMAT: VHS-SP   CH: {rng.randint(1,12):02d}",
+        f"SOURCE KEYWORD: {theme_key}",
+        f"ARCHIVE HASH: {hashlib.sha1(f'{theme_key}-{tape_no}'.encode()).hexdigest()[:12].upper()}",
+        "PLAYBACK NOTE: DO NOT PAUSE / DO NOT REWIND",
+        "ANOMALY NOTE: REDACTION IS NOT OPTIONAL",
+    ])
+    slides.append(Slide("slate_tape", "TAPE INFO", tape_slate, [], [], 2.8))
+
     # Intro
     if story.get("include_intro_outro", True):
         tech = [
@@ -488,6 +568,8 @@ def build_template_slides(rng: random.Random, theme_key: str, scraped_text: str,
     slides.append(Slide("agenda", "TODAY'S TRAINING",
                         redact_text(rng, agenda, render["redaction_strength"]*0.35),
                         pick(all_images, 1, 2), [], 2.6))
+
+    slides.append(Slide("slate_module", "MODULE 02 / WELLNESS", "SECTION: STANDARD WELLNESS\nSTATUS: OK", [], [], 1.6))
 
     normal_titles = ["WORKPLACE WELLNESS", "HAPPINESS HABITS", "PRODUCTIVITY TIP", "TEAM CULTURE", "OFFICE ETIQUETTE", "POSITIVE MINDSET"]
     normal_bullets = ["Hydrate every hour.", "Stretch wrists and neck.", "Keep notes simple.", "Smile (optional).",
@@ -570,19 +652,44 @@ def build_template_slides(rng: random.Random, theme_key: str, scraped_text: str,
             slides.append(Slide("fatal", "TRACKING LOST", body, [], pick(all_images, 0, 1), slide_seconds))
 
     if story.get("include_infographic", True):
-        body = "\n".join([
-            "COMPLIANCE METRICS (ARCHIVE ESTIMATE)",
-            f"TOPIC KEY: {theme_key.upper()}",
-            "• Recall stability drops after recognition events.",
-            "• Shadow with bright eyes correlates with missing minutes.",
-            "• Do not attempt pattern completion.",
-        ])
-        body = redact_text(rng, body, render["redaction_strength"]*0.7)
-        slides.insert(min(len(slides), 4 + rng.randint(0, 2)), Slide("infographic", "INFRASTRUCTURE HEALTH", body, pick(all_images, 0, 1), pick(all_images, 0, 1), slide_seconds))
+        # Insert a module slate and a data-driven infographic, then a forensic zoom slide.
+        slides.append(Slide("slate_module", "MODULE 03 / DATA REVIEW", "SECTION: DATA REVIEW\nNOTE: METRICS ARE ESTIMATED FROM SOURCE MATERIAL.", [], [], 1.6))
 
-    if rng.random() < 0.9:
-        puzzle = make_puzzle(rng, theme_key)
-        slides.insert(max(2, len(slides)-3), Slide("protocol", "VIEWER EXERCISE", puzzle, pick(all_images, 0, 1), pick(all_images, 0, 1), slide_seconds))
+        facts = extract_numeric_facts(scraped_text, max_items=6)
+        labels = theme_metric_labels(rng, theme_key, rel)
+
+        # Build chart items: mix extracted facts with generated measures.
+        chart_items: List[Tuple[str, float, str]] = []
+        for lab, val, unit in facts:
+            chart_items.append((lab[:10], float(val), unit))
+        while len(chart_items) < 5:
+            chart_items.append((labels[len(chart_items) % len(labels)], rng.randint(12, 98), "%"))
+
+        body_lines = [
+            "COMPLIANCE METRICS (ARCHIVE DERIVATION)",
+            f"TOPIC KEY: {theme_key.upper()}",
+            "SOURCE: WIKIPEDIA EXTRACT / COMMONS IMAGE SET",
+            "",
+        ]
+        for lab, val, unit in chart_items[:5]:
+            body_lines.append(f"• {lab}: {val:.0f}{unit}")
+        body_lines += [
+            "",
+            "OBSERVATION: RECALLED DETAILS DEGRADE AFTER RECOGNITION EVENTS.",
+            "NOTE: BRIGHT EYES IN SHADOW CORRELATE WITH MISSING MINUTES.",
+        ]
+        body = redact_text(rng, "\n".join(body_lines), render["redaction_strength"]*0.75)
+
+        slides.append(Slide("infographic", "INFRASTRUCTURE HEALTH", body, pick(all_images, 0, 1), pick(all_images, 0, 1), slide_seconds))
+
+        forensic_body = "\n".join([
+            "FORENSIC IMAGE REVIEW",
+            "• Inspect ocular highlights.",
+            "• Compare edge artifacts against tape noise.",
+            "• Do not attempt identity matching.",
+            "• If you recognize the shape: stop.",
+        ])
+        slides.append(Slide("forensic", "PHOTO INSPECTION", redact_text(rng, forensic_body, render['redaction_strength']*0.55), pick(all_images, 0, 1), pick(all_images, 1, 2), slide_seconds))
 
     if story.get("include_intro_outro", True):
         outro = "\n".join([
@@ -733,6 +840,28 @@ def timecode_overlay(ctx: RenderContext, frame: np.ndarray, frame_idx: int, ch: 
     d.text((16, ctx.H-34), tc, fill=(255,255,255), font=font)
     return np.array(im, dtype=np.uint8)
 
+
+
+def black_slate_frame(ctx: RenderContext, rng: random.Random, title: str, body: str) -> np.ndarray:
+    """Black tape-slate with mono text + slight VHS noise."""
+    W, H = ctx.W, ctx.H
+    im = Image.new("RGB", (W, H), (0, 0, 0))
+    d = ImageDraw.Draw(im)
+    fontM = _font_try(["DejaVuSansMono.ttf", "Courier New.ttf", "cour.ttf"], 18)
+    fontS = _font_try(["DejaVuSansMono.ttf", "Courier New.ttf", "cour.ttf"], 14)
+
+    d.text((32, 40), title, fill=(230, 230, 230), font=fontM)
+    y = 88
+    for line in body.split("\n"):
+        d.text((32, y), line[:72], fill=(200, 200, 200), font=fontS)
+        y += 22
+
+    arr = np.array(im, dtype=np.uint8)
+    # subtle noise + scanline
+    arr = vhs_stack(ctx, rng, arr)
+    return arr
+
+
 def face_uncanny(ctx: RenderContext, rng: random.Random, im: Image.Image, t: float) -> np.ndarray:
     base = np.array(cover_resize(im, ctx.W, ctx.H).convert("RGB"), dtype=np.uint8)
     pil = ImageOps.autocontrast(Image.fromarray(base))
@@ -806,112 +935,7 @@ def stamp_popup(ctx: RenderContext, rng: random.Random, frame: np.ndarray, popup
     out[y:ye, max(x,xe-3):xe] = 0
     return out
 
-
-def draw_chart_overlay(ctx: RenderContext, rng: random.Random, frame: np.ndarray, theme_key: str, strength: float) -> np.ndarray:
-    """
-    Render a 90s-style chart with plausible numbers derived from the theme.
-    This creates 'real data' vibes without needing external datasets.
-    """
-    strength = _clamp(strength, 0.2, 3.0)
-    im = Image.fromarray(frame)
-    d = ImageDraw.Draw(im, "RGBA")
-    font = _font_try(["DejaVuSans.ttf", "Arial.ttf", "arial.ttf"], 14)
-    mono = _font_try(["DejaVuSansMono.ttf", "Courier New.ttf", "cour.ttf"], 12)
-
-    # chart box
-    x0, y0, x1, y1 = int(ctx.W*0.06), int(ctx.H*0.60), int(ctx.W*0.74), int(ctx.H*0.93)
-    d.rounded_rectangle((x0, y0, x1, y1), radius=14, fill=(255,255,255,228), outline=(0,0,0,90), width=2)
-    d.text((x0+12, y0+10), f"DATA SUMMARY: {theme_key.upper()}", fill=(0,0,0,255), font=font)
-
-    # Seeded pseudo-data: stable per tape/theme, but different each run
-    h = hashlib.sha1((theme_key + str(rng.random())).encode("utf-8")).digest()
-    base = int.from_bytes(h[:2], "big") % 100
-    series = []
-    val = 35 + (base % 25)
-    for i in range(8):
-        drift = (int(h[2+i]) - 128) / 128.0
-        val = _clamp(val + drift*12.0, 5, 98)
-        series.append(val)
-
-    # axes
-    pad = 34
-    gx0, gy0 = x0+pad, y1-30
-    gx1, gy1 = x1-16, y0+40
-    d.line((gx0, gy0, gx1, gy0), fill=(0,0,0,160), width=2)
-    d.line((gx0, gy0, gx0, gy1), fill=(0,0,0,160), width=2)
-
-    # grid + labels
-    for k in range(1,5):
-        yy = gy0 - int((gy0-gy1)*k/5)
-        d.line((gx0, yy, gx1, yy), fill=(0,0,0,50), width=1)
-        d.text((x0+8, yy-7), f"{k*20:02d}", fill=(0,0,0,140), font=mono)
-
-    # plot
-    n = len(series)
-    pts = []
-    for i, v in enumerate(series):
-        xx = gx0 + int((gx1-gx0)*i/(n-1))
-        yy = gy0 - int((gy0-gy1)*(v/100.0))
-        pts.append((xx, yy))
-    for i in range(len(pts)-1):
-        d.line((pts[i][0], pts[i][1], pts[i+1][0], pts[i+1][1]), fill=(40,120,255,230), width=3)
-    for (xx,yy) in pts:
-        d.ellipse((xx-4, yy-4, xx+4, yy+4), fill=(0,0,0,220))
-
-    # footnote (redacted)
-    note = "SOURCE: INTERNAL TRAINING TELEMETRY // UNIT: COMPLIANCE INDEX"
-    if rng.random() < 0.55*strength:
-        note = redact_text(rng, note, 1.1*strength)
-    d.text((x0+12, y1-22), note, fill=(0,0,0,200), font=mono)
-    return np.array(im, dtype=np.uint8)
-
-
-def forensic_zoom_overlay(ctx: RenderContext, rng: random.Random, frame: np.ndarray, img: Image.Image, strength: float) -> np.ndarray:
-    """
-    Draw a forensic zoom box on a scraped image region (e.g. eyes / signage / hands).
-    """
-    strength = _clamp(strength, 0.2, 3.0)
-    W, H = ctx.W, ctx.H
-    base = Image.fromarray(frame)
-    d = ImageDraw.Draw(base, "RGBA")
-    mono = _font_try(["DejaVuSansMono.ttf", "Courier New.ttf", "cour.ttf"], 14)
-
-    # pick a crop region in the source image
-    src = img.convert("RGB")
-    sw, sh = src.size
-    cw, ch = int(sw*0.25), int(sh*0.25)
-    cx = rng.randint(int(sw*0.20), max(int(sw*0.80), int(sw*0.20)+1))
-    cy = rng.randint(int(sh*0.20), max(int(sh*0.80), int(sh*0.20)+1))
-    x0 = _clamp(cx - cw//2, 0, sw-cw)
-    y0 = _clamp(cy - ch//2, 0, sh-ch)
-    crop = src.crop((int(x0), int(y0), int(x0+cw), int(y0+ch)))
-    crop = ImageOps.autocontrast(crop)
-    crop = crop.filter(ImageFilter.UnsharpMask(radius=2, percent=int(220*strength), threshold=2))
-    crop = crop.resize((int(W*0.32), int(H*0.32)), Image.Resampling.NEAREST)
-
-    # place zoom at right
-    zx0, zy0 = int(W*0.73), int(H*0.18)
-    base.paste(crop, (zx0, zy0))
-    d.rectangle((zx0, zy0, zx0+crop.size[0], zy0+crop.size[1]), outline=(0,0,0,255), width=3)
-
-    # callout origin box on main frame
-    ox0 = rng.randint(int(W*0.08), int(W*0.55))
-    oy0 = rng.randint(int(H*0.18), int(H*0.52))
-    ow = int(W*(0.12 + 0.08*rng.random()))
-    oh = int(H*(0.10 + 0.08*rng.random()))
-    d.rectangle((ox0, oy0, ox0+ow, oy0+oh), outline=(255,255,255,230), width=2)
-    d.line((ox0+ow, oy0+oh, zx0, zy0), fill=(255,255,255,150), width=2)
-
-    # analyst text
-    tags = ["EYE-LIKE HIGHLIGHT", "ASYMMETRIC GAZE", "UNSIGNED PORTRAIT", "CAMERA REFLECTION", "ANOMALOUS EDGE", "CONTRAST SPIKE"]
-    line = f"INSPECTION: {rng.choice(tags)}"
-    if rng.random() < 0.65*strength:
-        line = redact_text(rng, line, 0.8*strength)
-    d.rectangle((zx0, zy0+crop.size[1]+6, W-12, zy0+crop.size[1]+34), fill=(0,0,0,160))
-    d.text((zx0+8, zy0+crop.size[1]+10), line, fill=(255,255,255,255), font=mono)
-    return np.array(base, dtype=np.uint8)
-
-def draw_infographic(ctx: RenderContext, rng: random.Random, frame: np.ndarray) -> np.ndarray:
+def draw_infographic(ctx: RenderContext, rng: random.Random, frame: np.ndarray, text: str = "") -> np.ndarray:
     im = Image.fromarray(frame)
     d = ImageDraw.Draw(im, "RGBA")
     font = _font_try(["DejaVuSans.ttf", "Arial.ttf"], 16)
@@ -919,9 +943,27 @@ def draw_infographic(ctx: RenderContext, rng: random.Random, frame: np.ndarray) 
     x0, y0, x1, y1 = int(ctx.W*0.78), 86, ctx.W-12, int(ctx.H*0.74)
     d.rounded_rectangle((x0, y0, x1, y1), radius=14, fill=(255,255,255,230), outline=(0,0,0,70), width=2)
     d.text((x0+10, y0+10), "METRICS", fill=(0,0,0,255), font=font)
-    labels = ["RECALL", "COMPLY", "SLEEP", "TRUST", "EYES"]
-    vals = [rng.randint(25, 95), rng.randint(20, 92), rng.randint(15, 88), rng.randint(10, 84), rng.randint(5, 90)]
-    if rng.random() < 0.6: vals[-1] = rng.randint(70, 99)
+    
+    # Try to parse metrics from slide body ("• LABEL: 42%"). Fallback to synthetic.
+    parsed = []
+    for line in (text or "").splitlines():
+        m = re.search(r"•\s*([A-Za-z0-9_ ]{2,14})\s*:\s*([0-9]{1,4})", line)
+        if m:
+            lab = re.sub(r"\s+", "", m.group(1).upper())[:10]
+            val = int(m.group(2))
+            parsed.append((lab, max(0, min(100, val))))
+    if parsed:
+        labels = [p[0] for p in parsed[:5]]
+        vals = [p[1] for p in parsed[:5]]
+        while len(labels) < 5:
+            labels.append(labels[-1])
+            vals.append(vals[-1])
+    else:
+        labels = ["RECALL", "COMPLY", "SLEEP", "TRUST", "EYES"]
+        vals = [rng.randint(18, 92) for _ in labels]
+        if rng.random() < 0.6:
+            vals[-1] = rng.randint(70, 99)
+
     bar_w = (x1-x0-28)
     yy = y0 + 44
     for lab, val in zip(labels, vals):
@@ -1168,6 +1210,16 @@ def render_video(rng: random.Random, cfg: Dict[str, Any], slides: List[Slide], o
     
     for slide in slides:
         nF = max(1, int(slide.seconds * FPS))
+
+        # Black slates (tape/module cards)
+        if str(slide.kind).startswith("slate_"):
+            for _ in range(nF):
+                fr = black_slate_frame(ctx, rng, slide.title, slide.body)
+                fr = timecode_overlay(ctx, fr, frame_idx, channel, tape_no)
+                writer.write(fr)
+                frame_idx += 1
+            continue
+
         ui = make_ui_layer(ctx, slide)
         bg = vibrant_bg(rng, W, H)
         if slide.bg_imgs:
@@ -1177,10 +1229,20 @@ def render_video(rng: random.Random, cfg: Dict[str, Any], slides: List[Slide], o
                 y = rng.randint(70, max(0, H-obj.shape[0]-70))
                 bg[y:y+obj.shape[0], x:x+obj.shape[1]] = obj
         
+        # Precompute forensic base if needed (to prevent jitter)
+        forensic_src = None
+        forensic_full = None
+        forensic_roi = None
+        if slide.kind == "forensic":
+            forensic_src = (slide.face_imgs[0] if slide.face_imgs else (slide.bg_imgs[0] if slide.bg_imgs else None))
+            if forensic_src is not None:
+                forensic_full = np.array(cover_resize(forensic_src, W, H).convert("RGB"), dtype=np.uint8)
+                forensic_roi = choose_forensic_roi(rng, W, H)
+
         for fi in range(nF):
             if plan.cut_frame is not None and frame_idx >= plan.cut_frame: break
             t = frame_idx / FPS
-            frame = bg.copy()
+            frame = (forensic_full.copy() if forensic_full is not None else bg.copy())
             if fi % 4 == 0:
                 frame = np.roll(frame, rng.randint(-2, 2), axis=1)
             
@@ -1191,8 +1253,31 @@ def render_video(rng: random.Random, cfg: Dict[str, Any], slides: List[Slide], o
                 frame = np.clip(frame.astype(np.float32)*(1-alpha) + face_arr.astype(np.float32)*alpha, 0, 255).astype(np.uint8)
             
             frame = alpha_over(frame, ui)
+
+            if slide.kind == "forensic" and forensic_full is not None and forensic_roi is not None:
+                x0, y0, x1, y1 = forensic_roi
+                crop = frame[y0:y1, x0:x1].copy()
+                if crop.size > 0:
+                    # Create inset
+                    inset_w, inset_h = 220, 160
+                    pil_in = Image.fromarray(crop).resize((inset_w, inset_h), Image.Resampling.NEAREST)
+                    pil_in = ImageOps.autocontrast(pil_in)
+                    inset = np.array(pil_in, dtype=np.uint8)
+                    # Place inset bottom-right
+                    ix = W - inset_w - 22
+                    iy = H - inset_h - 74
+                    frame[iy:iy+inset_h, ix:ix+inset_w] = inset
+                    # Mark ROI rectangle
+                    pil = Image.fromarray(frame)
+                    d = ImageDraw.Draw(pil)
+                    d.rectangle((x0, y0, x1, y1), outline=(255, 220, 60), width=2)
+                    d.rectangle((ix-2, iy-2, ix+inset_w+2, iy+inset_h+2), outline=(255, 220, 60), width=2)
+                    d.line((x0+(x1-x0)//2, y0, x0+(x1-x0)//2, y1), fill=(255,220,60), width=1)
+                    d.line((x0, y0+(y1-y0)//2, x1, y0+(y1-y0)//2), fill=(255,220,60), width=1)
+                    frame = np.array(pil, dtype=np.uint8)
+
             if slide.kind == "infographic" and rng.random() < 0.85:
-                frame = draw_infographic(ctx, rng, frame)
+                frame = draw_infographic(ctx, rng, frame, slide.body)
             
             frame = censor_blocks(ctx, rng, frame)
             
@@ -1319,7 +1404,7 @@ def main() -> None:
         web_imgs = web_imgs[:22]
 
     faces, objs = split_faces_and_objects(web_imgs + local_imgs)
-    slides = build_template_slides(rng, theme_key, scraped_text, objs, local_imgs, cfg, tape_no=tape_no)
+    slides = build_template_slides(rng, theme_key, scraped_text, objs, local_imgs, cfg, tape_no=tape_no, related_terms=related)
     for s in slides:
         if s.kind in ("protocol", "intermission") and not s.face_imgs and faces:
             s.face_imgs = [rng.choice(faces)]
