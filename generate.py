@@ -8,6 +8,7 @@ generate.py — "Found VHS Job Training" analogue horror PPT generator.
 - Lone Shooter entity: fictional shadow figure with bright eyes.
 - Audio: distorted 90s "training jingle" + noise stingers + TTS.
 - FIXED: Replaced imageio with direct ffmpeg piping to avoid backend errors.
+- FIXED: Corrected argument passing for timecode overlays and slate generation.
 
 Usage:
   python generate.py --config config.yaml --out out.mp4
@@ -38,7 +39,7 @@ from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 from scipy.io.wavfile import read as read_wav
 from scipy.io.wavfile import write as write_wav
 
-UA = "pptex-vhs-generator/3.1 (+github-actions; educational/art project)"
+UA = "pptex-vhs-generator/3.2 (+github-actions; educational/art project)"
 
 DEFAULTS: Dict[str, Any] = {
     "seed": 1337,
@@ -934,7 +935,7 @@ def stamp_popup(ctx: RenderContext, rng: random.Random, frame: np.ndarray, popup
     out[y:ye, max(x,xe-3):xe] = 0
     return out
 
-def draw_infographic(ctx: RenderContext, rng: random.Random, frame: np.ndarray) -> np.ndarray:
+def draw_infographic(ctx: RenderContext, rng: random.Random, frame: np.ndarray, text: str = "") -> np.ndarray:
     im = Image.fromarray(frame)
     d = ImageDraw.Draw(im, "RGBA")
     font = _font_try(["DejaVuSans.ttf", "Arial.ttf"], 16)
@@ -942,6 +943,7 @@ def draw_infographic(ctx: RenderContext, rng: random.Random, frame: np.ndarray) 
     x0, y0, x1, y1 = int(ctx.W*0.78), 86, ctx.W-12, int(ctx.H*0.74)
     d.rounded_rectangle((x0, y0, x1, y1), radius=14, fill=(255,255,255,230), outline=(0,0,0,70), width=2)
     d.text((x0+10, y0+10), "METRICS", fill=(0,0,0,255), font=font)
+    
     # Try to parse metrics from slide body ("• LABEL: 42%"). Fallback to synthetic.
     parsed = []
     for line in (text or "").splitlines():
@@ -1213,8 +1215,8 @@ def render_video(rng: random.Random, cfg: Dict[str, Any], slides: List[Slide], o
         if str(slide.kind).startswith("slate_"):
             for _ in range(nF):
                 fr = black_slate_frame(ctx, rng, slide.title, slide.body)
-                fr = timecode_overlay(ctx, fr, frame_idx)
-                writer.append_data(fr)
+                fr = timecode_overlay(ctx, fr, frame_idx, channel, tape_no)
+                writer.write(fr)
                 frame_idx += 1
             continue
 
@@ -1227,13 +1229,15 @@ def render_video(rng: random.Random, cfg: Dict[str, Any], slides: List[Slide], o
                 y = rng.randint(70, max(0, H-obj.shape[0]-70))
                 bg[y:y+obj.shape[0], x:x+obj.shape[1]] = obj
         
-        # Precompute forensic base if needed
+        # Precompute forensic base if needed (to prevent jitter)
         forensic_src = None
         forensic_full = None
+        forensic_roi = None
         if slide.kind == "forensic":
             forensic_src = (slide.face_imgs[0] if slide.face_imgs else (slide.bg_imgs[0] if slide.bg_imgs else None))
             if forensic_src is not None:
                 forensic_full = np.array(cover_resize(forensic_src, W, H).convert("RGB"), dtype=np.uint8)
+                forensic_roi = choose_forensic_roi(rng, W, H)
 
         for fi in range(nF):
             if plan.cut_frame is not None and frame_idx >= plan.cut_frame: break
@@ -1250,8 +1254,8 @@ def render_video(rng: random.Random, cfg: Dict[str, Any], slides: List[Slide], o
             
             frame = alpha_over(frame, ui)
 
-            if slide.kind == "forensic" and forensic_full is not None:
-                x0, y0, x1, y1 = choose_forensic_roi(rng, W, H)
+            if slide.kind == "forensic" and forensic_full is not None and forensic_roi is not None:
+                x0, y0, x1, y1 = forensic_roi
                 crop = frame[y0:y1, x0:x1].copy()
                 if crop.size > 0:
                     # Create inset
@@ -1273,7 +1277,7 @@ def render_video(rng: random.Random, cfg: Dict[str, Any], slides: List[Slide], o
                     frame = np.array(pil, dtype=np.uint8)
 
             if slide.kind == "infographic" and rng.random() < 0.85:
-                frame = draw_infographic(ctx, rng, frame)
+                frame = draw_infographic(ctx, rng, frame, slide.body)
             
             frame = censor_blocks(ctx, rng, frame)
             
