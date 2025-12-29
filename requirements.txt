@@ -1,0 +1,6 @@
+requests
+pyyaml
+numpy
+scipy
+pillow
+imageio
